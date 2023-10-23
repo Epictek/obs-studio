@@ -83,11 +83,14 @@ struct _obs_pipewire {
 
 	struct pw_core *core;
 	struct spa_hook core_listener;
+	struct pw_registry *registry;
+	struct spa_hook registry_listener;
 	int server_version_sync;
 
 	struct obs_pw_version server_version;
 
 	GPtrArray *streams;
+	void *userdata;
 };
 
 struct _obs_pipewire_stream {
@@ -783,6 +786,7 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 	struct spa_buffer *buffer;
 	struct pw_buffer *b;
 	bool has_buffer = true;
+	bool swap_red_blue = false;
 
 	b = find_latest_buffer(obs_pw_stream->stream);
 	if (!b) {
@@ -800,13 +804,6 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 	}
 
 	obs_enter_graphics();
-
-	// Workaround for kwin behaviour pre 5.27.5
-	// Workaround for mutter behaviour pre GNOME 43
-	// Only check this if !SPA_META_Header, once supported platforms update.
-	has_buffer = buffer->datas[0].chunk->size != 0;
-	if (!has_buffer)
-		goto read_metadata;
 
 	if (buffer->datas[0].type == SPA_DATA_DmaBuf) {
 		uint32_t planes = buffer->n_datas;
@@ -873,6 +870,13 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 			goto read_metadata;
 		}
 	} else {
+		// Workaround for kwin behaviour pre 5.27.5
+		// Workaround for mutter behaviour pre GNOME 43
+		// Only check this if !SPA_META_Header, once supported platforms update.
+		bool has_buffer = buffer->datas[0].chunk->size != 0;
+		if (!has_buffer)
+			goto read_metadata;
+
 		blog(LOG_DEBUG, "[pipewire] Buffer has memory texture");
 
 		if (!lookup_format_info_from_spa_format(
@@ -1164,11 +1168,15 @@ static const struct pw_core_events core_events = {
 
 /* obs_source_info methods */
 
-obs_pipewire *obs_pipewire_create(int pipewire_fd)
+obs_pipewire *
+obs_pipewire_create(int pipewire_fd,
+		    const struct pw_registry_events *registry_events,
+		    void *userdata)
 {
 	obs_pipewire *obs_pw;
 
 	obs_pw = bzalloc(sizeof(obs_pipewire));
+	obs_pw->userdata = userdata;
 	obs_pw->pipewire_fd = pipewire_fd;
 	obs_pw->thread_loop = pw_thread_loop_new("PipeWire thread loop", NULL);
 	obs_pw->context = pw_context_new(
@@ -1183,9 +1191,14 @@ obs_pipewire *obs_pipewire_create(int pipewire_fd)
 	pw_thread_loop_lock(obs_pw->thread_loop);
 
 	/* Core */
-	obs_pw->core = pw_context_connect_fd(
-		obs_pw->context, fcntl(obs_pw->pipewire_fd, F_DUPFD_CLOEXEC, 5),
-		NULL, 0);
+	if (obs_pw->pipewire_fd != -1) {
+		obs_pw->core = pw_context_connect_fd(obs_pw->context,
+						     fcntl(obs_pw->pipewire_fd,
+							   F_DUPFD_CLOEXEC, 5),
+						     NULL, 0);
+	} else {
+		obs_pw->core = pw_context_connect(obs_pw->context, NULL, 0);
+	}
 	if (!obs_pw->core) {
 		blog(LOG_WARNING, "Error creating PipeWire core: %m");
 		pw_thread_loop_unlock(obs_pw->thread_loop);
@@ -1196,7 +1209,15 @@ obs_pipewire *obs_pipewire_create(int pipewire_fd)
 	pw_core_add_listener(obs_pw->core, &obs_pw->core_listener, &core_events,
 			     obs_pw);
 
-	// Dispatch to receive the info core event
+	if (registry_events) {
+		obs_pw->registry = pw_core_get_registry(obs_pw->core,
+							PW_VERSION_REGISTRY, 0);
+		pw_registry_add_listener(obs_pw->registry,
+					 &obs_pw->registry_listener,
+					 registry_events, obs_pw);
+	}
+
+	// Dispatch to receive the info core event and registry
 	obs_pw->server_version_sync = pw_core_sync(obs_pw->core, PW_ID_CORE,
 						   obs_pw->server_version_sync);
 	pw_thread_loop_wait(obs_pw->thread_loop);
@@ -1220,6 +1241,15 @@ void obs_pipewire_destroy(obs_pipewire *obs_pw)
 	g_clear_pointer(&obs_pw->streams, g_ptr_array_unref);
 	teardown_pipewire(obs_pw);
 	bfree(obs_pw);
+}
+
+void obs_pipewire_set_userdata(obs_pipewire *obs_pw, void *userdata)
+{
+	obs_pw->userdata = userdata;
+}
+void *obs_pipewire_get_userdata(obs_pipewire *obs_pw)
+{
+	return obs_pw->userdata;
 }
 
 obs_pipewire_stream *
@@ -1263,6 +1293,7 @@ obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_source_t *source,
 
 	if (!build_format_params(obs_pw_stream, &pod_builder, &params,
 				 &n_params)) {
+		blog(LOG_ERROR, "[pipewire] Failed to build format params");
 		pw_thread_loop_unlock(obs_pw->thread_loop);
 		bfree(obs_pw_stream);
 		return NULL;
