@@ -25,6 +25,7 @@
 
 #include <pipewire/pipewire.h>
 #include "screencast-portal.h"
+#include "gamescope.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("linux-pipewire", "en-US")
@@ -42,6 +43,7 @@ bool obs_module_load(void)
 	pw_init(NULL, NULL);
 
 	screencast_portal_load();
+	gamescope_load();
 
 	return true;
 }
@@ -49,6 +51,7 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	screencast_portal_unload();
+	gamescope_unload();
 
 #if PW_CHECK_VERSION(0, 3, 49)
 	pw_deinit();
